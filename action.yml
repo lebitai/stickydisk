@@ -1,0 +1,70 @@
+name: 'LebitSH Sticky Disk'
+description: 'Drop-in replacement for useblacksmith/stickydisk@v1 mounting NVMe CoW persistent storage across CI runs'
+inputs:
+  key:
+    description: 'Unique sticky disk key per repository'
+    required: true
+  path:
+    description: 'Directory path to mount the sticky disk'
+    required: true
+  read-only:
+    description: 'Mount sticky disk without committing mutations back to base snapshot'
+    required: false
+    default: 'false'
+outputs:
+  lease-id:
+    description: 'Mounted sticky disk lease ID'
+    value: ${{ steps.mount.outputs.lease_id }}
+  mount-path:
+    description: 'Backing filesystem mount path'
+    value: ${{ steps.mount.outputs.mount_path }}
+runs:
+  using: 'composite'
+  steps:
+    - id: mount
+      name: Mount LebitSH Sticky Disk
+      shell: bash
+      env:
+        DISK_KEY: ${{ inputs.key }}
+        TARGET_PATH: ${{ inputs.path }}
+      run: |
+        set -euo pipefail
+        STORAGE_URL="${LEBIT_STORAGE_URL:-http://172.28.0.1:8082}"
+        JOB_TOKEN="${LEBIT_JOB_TOKEN:-${LEBIT_STICKYDISK_TOKEN:-}}"
+        if [[ -z "${JOB_TOKEN}" ]]; then
+          echo "::warning::LEBIT_JOB_TOKEN not set; creating empty directory at ${TARGET_PATH} instead of mounting LebitSH Sticky Disk."
+          mkdir -p "${TARGET_PATH}"
+          exit 0
+        fi
+        PAYLOAD=$(jq -nc \
+          --arg job_id "${LEBIT_JOB_ID:-local}" \
+          --arg repo "${GITHUB_REPOSITORY:-}" \
+          --arg key "${DISK_KEY}" \
+          --arg branch "${GITHUB_REF_NAME:-main}" \
+          --arg event "${GITHUB_EVENT_NAME:-push}" \
+          '{job_id:$job_id,repo_full_name:$repo,disk_key:$key,disk_type:"stickydisk",branch:$branch,event:$event}')
+        RESP=$(curl -fsS --max-time 15 -X POST "${STORAGE_URL%/}/v1/stickydisk/mount" \
+          -H "Authorization: Bearer ${JOB_TOKEN}" \
+          -H "Content-Type: application/json" \
+          -d "${PAYLOAD}")
+        CONTAINER_PATH=$(echo "${RESP}" | jq -r '.container_mount_path // empty')
+        HOST_PATH=$(echo "${RESP}" | jq -r '.mount_path // empty')
+        LEASE_ID=$(echo "${RESP}" | jq -r '.lease_id // empty')
+
+        # Prefer container-visible bind path (/lebit-mounts/<lease_id>) inside container sandboxes,
+        # falling back to host/virtio-blk path on bare-metal or Firecracker MicroVMs.
+        if [[ -n "${CONTAINER_PATH}" && -d "$(dirname "${CONTAINER_PATH}")" ]]; then
+          MOUNT_PATH="${CONTAINER_PATH}"
+        else
+          MOUNT_PATH="${HOST_PATH}"
+        fi
+
+        mkdir -p "$(dirname "${TARGET_PATH}")"
+        rm -rf "${TARGET_PATH}"
+        ln -sfn "${MOUNT_PATH}" "${TARGET_PATH}"
+        if [[ -n "${GITHUB_ENV:-}" && -n "${LEASE_ID}" ]]; then
+          echo "LEBIT_STICKYDISK_LEASE_ID=${LEASE_ID}" >> "${GITHUB_ENV}"
+        fi
+        echo "lease_id=${LEASE_ID}" >> "${GITHUB_OUTPUT}"
+        echo "mount_path=${MOUNT_PATH}" >> "${GITHUB_OUTPUT}"
+        echo "Mounted LebitSH Sticky Disk '${DISK_KEY}' (lease=${LEASE_ID}) -> ${TARGET_PATH} (backing=${MOUNT_PATH})"
